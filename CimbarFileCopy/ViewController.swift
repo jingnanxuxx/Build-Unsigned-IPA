@@ -22,6 +22,10 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
     private let progressLabel = UILabel()
     private let logView = UITextView()
     private let toggleButton = UIButton(type: .system)
+    private let enginePreview = UIImageView()   // 引擎实时视角小窗（显示送进引擎的帧）
+    private let crosshairView = UIView()        // 瞄准准星框（条码需填满此框）
+    private var crosshairAspect: CGFloat = 1.0
+    private let crosshairLayer = CAShapeLayer()
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -58,6 +62,15 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
                 self?.present(avc, animated: true, completion: nil)
             }
         }
+        dec.onMode = { [weak self] mode in
+            DispatchQueue.main.async {
+                var aspect: CGFloat = 1.0
+                if mode == 66 { aspect = 1.1516 }        // Bu
+                else if mode == 67 { aspect = 1.413 }    // Bm
+                self?.crosshairAspect = aspect
+                self?.view.setNeedsLayout()
+            }
+        }
         dec.start()
         appendLog("等待解码引擎就绪…")
 
@@ -79,6 +92,34 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         super.viewDidLayoutSubviews()
         // 相机预览跟随视图尺寸（旋转、第一次布局都会触发）
         previewLayer.frame = view.bounds
+        updateCrosshairPath()
+    }
+
+    /// 准星框：条码应填满此框（宽=画面宽，高=宽×模式比例，与网页端一致）
+    private func updateCrosshairPath() {
+        let bounds = view.bounds
+        let margin: CGFloat = 12
+        let rectWidth = bounds.width - margin * 2
+        let rectHeight = rectWidth * crosshairAspect
+        let rect = CGRect(x: margin,
+                          y: (bounds.height - rectHeight) / 2,
+                          width: rectWidth,
+                          height: rectHeight)
+        let len: CGFloat = 34
+        let path = UIBezierPath()
+        let corners: [(CGPoint, Bool, Bool)] = [
+            (CGPoint(x: rect.minX, y: rect.minY), true, true),
+            (CGPoint(x: rect.maxX, y: rect.minY), false, true),
+            (CGPoint(x: rect.minX, y: rect.maxY), true, false),
+            (CGPoint(x: rect.maxX, y: rect.maxY), false, false)
+        ]
+        for (p, horRight, verDown) in corners {
+            path.move(to: p)
+            path.addLine(to: CGPoint(x: p.x + (horRight ? len : -len), y: p.y))
+            path.move(to: p)
+            path.addLine(to: CGPoint(x: p.x, y: p.y + (verDown ? len : -len)))
+        }
+        crosshairLayer.path = path.cgPath
     }
 
     // MARK: - 日志
@@ -133,7 +174,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         frameCount = 0
         sessionQueue.async { [weak self] in self?.session.startRunning() }
         toggleButton.setTitle("停止接收", for: .normal)
-        statusLabel.text = "对准电脑屏幕上的彩色条码，保持 15–40cm"
+        statusLabel.text = "把彩色条码放大到填满绿色方框，保持 15–40cm"
 
         // 3 秒后检查相机是否真的在出帧
         frameCheckTimer?.invalidate()
@@ -179,9 +220,26 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         framePending = true
         frameCount += 1
         let b64 = rgba.data.base64EncodedString()
+        if frameCount % 8 == 0, let img = Self.imageFromRgba(rgba.data, rgba.width, rgba.height) {
+            DispatchQueue.main.async { [weak self] in self?.enginePreview.image = img }
+        }
         decoder?.feedFrame(base64: b64, width: rgba.width, height: rgba.height) { [weak self] in
             self?.framePending = false
         }
+    }
+
+    /// 把送进引擎的 RGBA 帧转成 UIImage，用于实时预览（诊断用）
+    private static func imageFromRgba(_ data: Data, _ w: Int, _ h: Int) -> UIImage? {
+        guard w > 0, h > 0,
+              let provider = CGDataProvider(data: data as CFData),
+              let cg = CGImage(width: w, height: h,
+                               bitsPerComponent: 8, bitsPerPixel: 32,
+                               bytesPerRow: w * 4,
+                               space: CGColorSpaceCreateDeviceRGB(),
+                               bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                               provider: provider, decode: nil,
+                               shouldInterpolate: false, intent: .defaultIntent) else { return nil }
+        return UIImage(cgImage: cg)
     }
 
     /// BGRA 像素 → 缩小到短边约 360px 的 RGBA 像素（与网页端 16:9 采集口径一致）
@@ -195,7 +253,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         guard srcW > 0, srcH > 0 else { return nil }
 
         let shortSide = min(srcW, srcH)
-        let scale = 360.0 / Double(shortSide)
+        let scale = 540.0 / Double(shortSide)
         let tw = max(1, Int((Double(srcW) * scale).rounded()))
         let th = max(1, Int((Double(srcH) * scale).rounded()))
         let dstRow = tw * 4
@@ -250,6 +308,20 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         logView.layer.cornerRadius = 10
         logView.text = "解码引擎加载中…"
 
+        enginePreview.contentMode = .scaleAspectFill
+        enginePreview.clipsToBounds = true
+        enginePreview.layer.cornerRadius = 8
+        enginePreview.layer.borderWidth = 1
+        enginePreview.layer.borderColor = UIColor.systemGreen.cgColor
+        enginePreview.backgroundColor = UIColor(white: 0.2, alpha: 0.6)
+
+        crosshairView.isUserInteractionEnabled = false
+        crosshairView.backgroundColor = .clear
+        crosshairLayer.strokeColor = UIColor.systemGreen.cgColor
+        crosshairLayer.lineWidth = 3
+        crosshairLayer.fillColor = UIColor.clear.cgColor
+        crosshairView.layer.addSublayer(crosshairLayer)
+
         toggleButton.setTitle("开始接收", for: .normal)
         toggleButton.setTitleColor(.black, for: .normal)
         toggleButton.titleLabel?.font = .systemFont(ofSize: 17, weight: .semibold)
@@ -257,15 +329,25 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         toggleButton.layer.cornerRadius = 22
         toggleButton.addTarget(self, action: #selector(toggle(_:)), for: .touchUpInside)
 
-        [statusLabel, progressView, progressLabel, logView, toggleButton].forEach {
+        [statusLabel, progressView, progressLabel, logView, enginePreview, crosshairView, toggleButton].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview($0)
         }
 
         NSLayoutConstraint.activate([
+            crosshairView.topAnchor.constraint(equalTo: view.topAnchor),
+            crosshairView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            crosshairView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            crosshairView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
             statusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
             statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
-            statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -152),
+
+            enginePreview.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            enginePreview.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            enginePreview.widthAnchor.constraint(equalToConstant: 132),
+            enginePreview.heightAnchor.constraint(equalToConstant: 74),
 
             progressView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 14),
             progressView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 32),

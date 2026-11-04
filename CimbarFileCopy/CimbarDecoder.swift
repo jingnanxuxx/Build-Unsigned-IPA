@@ -9,6 +9,7 @@ final class CimbarDecoder: NSObject, WKScriptMessageHandler, WKNavigationDelegat
     var onLog: ((String) -> Void)?
     var onProgress: ((Double) -> Void)?
     var onFile: ((URL, String) -> Void)?
+    var onMode: ((Int) -> Void)?
 
     let webView: WKWebView
     private var ready = false
@@ -126,6 +127,10 @@ final class CimbarDecoder: NSObject, WKScriptMessageHandler, WKNavigationDelegat
             onLog?("解码引擎就绪")
         case "log":
             onLog?(body["msg"] as? String ?? "")
+        case "mode":
+            if let mode = body["mode"] as? Int {
+                onMode?(mode)
+            }
         case "progress":
             if let report = body["report"] as? [NSNumber] {
                 let maxFraction = report.map { $0.doubleValue }.max() ?? 0
