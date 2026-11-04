@@ -275,48 +275,40 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
                                 width: vImagePixelCount(srcW),
                                 rowBytes: CVPixelBufferGetBytesPerRow(pixelBuffer))
 
-        var scaled = [UInt8](repeating: 0, count: tw * th * 4)
-        var scaleOK = false
-        scaled.withUnsafeMutableBytes { sb in
-            guard let sbPtr = sb.baseAddress else { return }
-            var scaleBuf = vImage_Buffer(data: sbPtr,
-                                         height: vImagePixelCount(th),
-                                         width: vImagePixelCount(tw),
-                                         rowBytes: dstRow)
-            scaleOK = vImageScale_ARGB8888(&src, &scaleBuf, nil, vImage_Flags(kvImageHighQualityResampling)) == kvImageNoError
-        }
-        guard scaleOK else { return nil }
+        // 目标缓冲用原生指针手工分配：保证 vImage 写进真实连续内存（不用 &数组、不用 withUnsafe，避免黑帧与编译器问题）
+        let count = tw * th * 4
 
-        var out = [UInt8](repeating: 0, count: tw * th * 4)
+        let scaledPtr = UnsafeMutableRawPointer.allocate(byteCount: count, alignment: 16)
+        defer { scaledPtr.deallocate() }
+        var scaleBuf = vImage_Buffer(data: scaledPtr,
+                                     height: vImagePixelCount(th),
+                                     width: vImagePixelCount(tw),
+                                     rowBytes: dstRow)
+        guard vImageScale_ARGB8888(&src, &scaleBuf, nil, vImage_Flags(kvImageHighQualityResampling)) == kvImageNoError else { return nil }
+
+        let outPtr = UnsafeMutableRawPointer.allocate(byteCount: count, alignment: 16)
+        defer { outPtr.deallocate() }
+        var outBuf = vImage_Buffer(data: outPtr,
+                                   height: vImagePixelCount(th),
+                                   width: vImagePixelCount(tw),
+                                   rowBytes: dstRow)
         let permute: [UInt8] = [2, 1, 0, 3]
-        guard let scaledPtr = scaled.withUnsafeBytes({ $0.baseAddress }) else { return nil }
-        var permuteOK = false
-        out.withUnsafeMutableBytes { ob in
-            guard let obPtr = ob.baseAddress else { return }
-            var scaleBuf = vImage_Buffer(data: scaledPtr,
-                                         height: vImagePixelCount(th),
-                                         width: vImagePixelCount(tw),
-                                         rowBytes: dstRow)
-            var outBuf = vImage_Buffer(data: obPtr,
-                                       height: vImagePixelCount(th),
-                                       width: vImagePixelCount(tw),
-                                       rowBytes: dstRow)
-            permuteOK = vImagePermuteChannels_ARGB8888(&outBuf, &scaleBuf, permute, vImage_Flags(kvImageNoFlags)) == kvImageNoError
-        }
-        guard permuteOK else { return nil }
+        guard vImagePermuteChannels_ARGB8888(&outBuf, &scaleBuf, permute, vImage_Flags(kvImageNoFlags)) == kvImageNoError else { return nil }
+
+        let outData = Data(bytes: outPtr, count: count)
 
         // 亮度均值自检（采样），用于发现黑帧
         var sum: UInt64 = 0
         var n: UInt64 = 0
         var i = 0
-        while i < out.count {
-            sum += UInt64(out[i])
+        while i < count {
+            sum += UInt64(outData[i])
             n += 1
             i += 64
         }
         let mean: UInt64 = n > 0 ? sum / n : 0
 
-        return (Data(out), tw, th, mean)
+        return (outData, tw, th, mean)
     }
 
     // MARK: - UI
