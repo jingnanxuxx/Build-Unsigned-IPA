@@ -3,6 +3,7 @@ import WebKit
 
 /// 解码引擎宿主：把原生采集的 RGBA 像素喂给隐藏 WKWebView 中的 cimbar 解码引擎。
 /// 引擎只做纯计算（不渲染相机画面，因此不受 iOS 15.0.2 的 WKWebView 相机黑屏 bug 影响）。
+/// 引擎 HTML 以内嵌 base64 直接 loadHTMLString，不依赖 Bundle 资源打包。
 final class CimbarDecoder: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
 
     var onLog: ((String) -> Void)?
@@ -12,7 +13,9 @@ final class CimbarDecoder: NSObject, WKScriptMessageHandler, WKNavigationDelegat
     let webView: WKWebView
     private var ready = false
     private var probeTimer: Timer?
-    private var probeState = 0   // 0=未知 1=页面已加载 2=引擎对象已建 3=引擎就绪 4=页面不可达
+    private var probeState = 0   // 0=未执行 1=页面已执行 2=引擎对象已建 3=引擎就绪
+
+    var isReady: Bool { ready }
 
     override init() {
         let config = WKWebViewConfiguration()
@@ -32,29 +35,17 @@ final class CimbarDecoder: NSObject, WKScriptMessageHandler, WKNavigationDelegat
 
     /// 由 ViewController 在回调接好之后调用（保证所有日志都能显示）。
     func start() {
-        let checks: [(String, String)] = [("decoder", "html"), ("cimbar_js", "js")]
-        var missing: [String] = []
-        for (name, ext) in checks {
-            if Bundle.main.url(forResource: name, withExtension: ext) == nil {
-                missing.append(name + "." + ext)
-            }
+        guard let data = Data(base64Encoded: DecoderHTML.base64),
+              let html = String(data: data, encoding: .utf8) else {
+            onLog?("内嵌引擎解码失败")
+            return
         }
-        if missing.isEmpty {
-            onLog?("资源检查 OK")
-        } else {
-            onLog?("资源缺失: " + missing.joined(separator: ", "))
-        }
-
-        if let url = Bundle.main.url(forResource: "decoder", withExtension: "html") {
-            onLog?("加载 decoder.html")
-            webView.loadFileURL(url, allowingReadAccessTo: Bundle.main.bundleURL)
-        } else {
-            onLog?("decoder.html 不在包内")
-        }
+        onLog?("内嵌引擎已解出 (\(html.count) 字符)")
+        webView.loadHTMLString(html, baseURL: nil)
         startProbe()
     }
 
-    /// 每 2 秒主动探测一次页面/引擎状态，不依赖 JS 主动上报，避免日志被吞。
+    /// 每 2 秒主动探测一次引擎状态（检查我们自己的脚本是否真正执行，规避空页面误报）。
     private func startProbe() {
         let t = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in self?.probe() }
         probeTimer = t
@@ -62,7 +53,7 @@ final class CimbarDecoder: NSObject, WKScriptMessageHandler, WKNavigationDelegat
     }
 
     private func probe() {
-        let js = "(function(){return {rs: document.readyState, cim: (typeof window.__cim !== 'undefined') ? 1 : 0, mod: (typeof Module !== 'undefined' && typeof Module._cimbard_get_bufsize === 'function') ? 1 : 0};})()"
+        let js = "(function(){return {br:(typeof window.CimbarBridge !== 'undefined')?1:0, cim:(typeof window.__cim !== 'undefined')?1:0, mod:(typeof Module !== 'undefined' && typeof Module._cimbard_get_bufsize === 'function')?1:0};})()"
         webView.evaluateJavaScript(js) { [weak self] result, error in
             guard let self = self else { return }
             if let error = error {
@@ -73,16 +64,16 @@ final class CimbarDecoder: NSObject, WKScriptMessageHandler, WKNavigationDelegat
                 return
             }
             guard let d = result as? [String: Any] else { return }
-            let rs = d["rs"] as? String ?? ""
+            let br = (d["br"] as? NSNumber)?.intValue ?? 0
             let cim = (d["cim"] as? NSNumber)?.intValue ?? 0
             let mod = (d["mod"] as? NSNumber)?.intValue ?? 0
             var state = 0
-            if rs == "complete" { state = 1 }
+            if br == 1 { state = 1 }
             if cim == 1 { state = 2 }
             if mod == 1 { state = 3 }
             if state > self.probeState {
                 self.probeState = state
-                let labels = ["", "页面已加载(探针)", "引擎对象已创建(探针)", "引擎就绪(探针)"]
+                let labels = ["", "引擎页面已执行(探针)", "引擎对象已创建(探针)", "引擎就绪(探针)"]
                 self.onLog?(labels[state])
             }
             if state == 3 && !self.ready {

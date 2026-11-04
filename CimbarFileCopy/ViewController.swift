@@ -141,7 +141,11 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
             guard let self = self else { return }
             DispatchQueue.main.async {
                 if self.frameCount > 0 {
-                    self.appendLog("相机帧已送达 \(self.frameCount) 帧")
+                    if let d = self.decoder, d.isReady {
+                        self.appendLog("相机帧已送达 \(self.frameCount) 帧")
+                    } else {
+                        self.appendLog("相机帧已送达 \(self.frameCount) 帧（引擎未就绪，暂未解码）")
+                    }
                 } else {
                     self.appendLog("警告: 相机无帧输出")
                 }
