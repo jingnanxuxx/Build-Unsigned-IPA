@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Cimbar 解码引擎</title>
+<style>html,body{margin:0;padding:0;background:#000;}</style>
+</head>
+<body>
+<script src="wasm_b64.js"></script>
+<script>
+// ============================================================
+// 原生壳 ↔ 解码引擎桥（CimbarFileCopy）
+// wasm 直接内嵌（wasm_b64.js → Module.wasmBinary），不走文件/网络请求，
+// 避免 WKWebView 在 file:// 环境下加载 wasm 失败导致引擎不初始化。
+// 调用链与网页端 recv.js / recv-worker.js / zstd.js 1:1 对应。
+// ============================================================
+
+function post(obj) {
+  try { window.webkit.messageHandlers.cimbar.postMessage(obj); } catch (e) {}
+}
+
+post({ type: "log", msg: "页面已加载" });
+
+function b64ToBytes(b64) {
+  var bin = atob(b64);
+  var u8 = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+
+var Module = {};
+try {
+  if (typeof window.WASM_B64 !== "string" || window.WASM_B64.length < 100) {
+    throw new Error("WASM_B64 缺失");
+  }
+  Module.wasmBinary = b64ToBytes(window.WASM_B64);
+  post({ type: "log", msg: "wasm 已解码 " + Math.round(Module.wasmBinary.length / 1048576 * 10) / 10 + " MB" });
+} catch (e) {
+  post({ type: "log", msg: "wasm 解码失败: " + e });
+}
+
+Module.onRuntimeInitialized = function () {
+  try {
+    var bufsize = Module._cimbard_get_bufsize();
+    var imgPtr = Module._malloc(1280 * 720 * 4);
+    var fountainPtr = Module._malloc(bufsize);
+    window.__cim = { imgPtr: imgPtr, imgCap: 1280 * 720 * 4, fountainPtr: fountainPtr, bufsize: bufsize };
+    post({ type: "ready" });
+  } catch (e) {
+    post({ type: "log", msg: "引擎初始化失败: " + e });
+  }
+};
+
+var _mode = 0;            // 0=自动；66=Bu, 68=B, 67=Bm, 4=4C
+var _candidates = [66, 68, 67, 4];
+var _ci = 0;
+var _reportPtr = 0;
+
+function readReport() {
+  if (!_reportPtr) _reportPtr = Module._malloc(1024);
+  var n = Module._cimbard_get_report(_reportPtr, 1024);
+  if (n > 0) {
+    var v = new Uint8Array(Module.HEAPU8.buffer, _reportPtr, n);
+    var txt = new TextDecoder().decode(v);
+    try { return JSON.parse(txt); } catch (e) { return null; }
+  }
+  return null;
+}
+
+function bytesToB64(u8) {
+  var s = "";
+  for (var i = 0; i < u8.length; i += 16384) {
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + 16384));
+  }
+  return btoa(s);
+}
+
+function assembleFile(res) {
+  var id = Number(res & 0xFFFFFFFFn);
+  var size = Module._cimbard_get_filesize(id);
+
+  var fname = "";
+  var nameBuf = Module._malloc(1024);
+  var nameLen = Module._cimbard_get_filename(id, nameBuf, 1024);
+  if (nameLen > 0) {
+    fname = new TextDecoder("utf-8").decode(new Uint8Array(Module.HEAPU8.buffer, nameBuf, nameLen));
+  }
+  Module._free(nameBuf);
+
+  var chunkSize = Module._cimbard_get_decompress_bufsize();
+  if (chunkSize <= 0) chunkSize = 65536;
+  var dbuf = Module._malloc(chunkSize);
+  var parts = [];
+  for (;;) {
+    var n = Module._cimbard_decompress_read(id, dbuf, chunkSize);
+    if (n <= 0) break;
+    parts.push(new Uint8Array(Module.HEAPU8.buffer, dbuf, n).slice());
+  }
+  Module._free(dbuf);
+
+  var total = 0;
+  for (var i = 0; i < parts.length; i++) total += parts[i].length;
+  var out = new Uint8Array(total);
+  var off = 0;
+  for (var j = 0; j < parts.length; j++) { out.set(parts[j], off); off += parts[j].length; }
+
+  var name = fname || (String(id) + "_" + String(size));
+  post({ type: "file", name: name, size: total, base64: bytesToB64(out) });
+}
+
+window.CimbarBridge = {
+  feed: function (b64, w, h) {
+    try {
+      var m = window.__cim;
+      if (!m) return -1;
+      var u8 = b64ToBytes(b64);
+      if (u8.length > m.imgCap) {
+        Module._free(m.imgPtr);
+        m.imgPtr = Module._malloc(u8.length);
+        m.imgCap = u8.length;
+      }
+      Module.HEAPU8.set(u8, m.imgPtr);
+
+      var mode = _mode || _candidates[_ci++ % _candidates.length];
+      Module._cimbard_configure_decode(mode);
+      var len = Module._cimbard_scan_extract_decode(m.imgPtr, w, h, 4, m.fountainPtr, m.bufsize);
+      if (len <= 0) return len;   // 0=nodata, -3=failed_extract
+
+      if (!_mode) _mode = mode;   // 首个返回数据的模式即锁定
+
+      var res = Module._cimbard_fountain_decode(m.fountainPtr, len);
+
+      var rep = readReport();
+      if (rep && Array.isArray(rep) && rep.length) post({ type: "progress", report: rep });
+
+      var rn = Number(res);
+      if (rn > 0) assembleFile(res);
+      return rn;
+    } catch (e) {
+      post({ type: "log", msg: "解码错误: " + e });
+      return -999;
+    }
+  }
+};
+</script>
+<script src="cimbar_js.js"></script>
+</body>
+</html>
