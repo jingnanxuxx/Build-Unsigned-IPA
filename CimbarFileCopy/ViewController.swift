@@ -276,21 +276,24 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
                                 rowBytes: CVPixelBufferGetBytesPerRow(pixelBuffer))
 
         var scaled = [UInt8](repeating: 0, count: tw * th * 4)
-        let scaleErr = scaled.withUnsafeMutableBytes { (sb: UnsafeMutableRawBufferPointer) -> vImage_Error in
-            guard let sbPtr = sb.baseAddress else { return vImage_Error(kvImageMemoryAllocationError) }
+        var scaleOK = false
+        scaled.withUnsafeMutableBytes { sb in
+            guard let sbPtr = sb.baseAddress else { return }
             var scaleBuf = vImage_Buffer(data: sbPtr,
                                          height: vImagePixelCount(th),
                                          width: vImagePixelCount(tw),
                                          rowBytes: dstRow)
-            return vImageScale_ARGB8888(&src, &scaleBuf, nil, vImage_Flags(kvImageHighQualityResampling))
+            scaleOK = vImageScale_ARGB8888(&src, &scaleBuf, nil, vImage_Flags(kvImageHighQualityResampling)) == kvImageNoError
         }
-        guard scaleErr == kvImageNoError else { return nil }
+        guard scaleOK else { return nil }
 
         var out = [UInt8](repeating: 0, count: tw * th * 4)
         let permute: [UInt8] = [2, 1, 0, 3]
-        let permuteErr = out.withUnsafeMutableBytes { (ob: UnsafeMutableRawBufferPointer) -> vImage_Error in
-            guard let obPtr = ob.baseAddress else { return vImage_Error(kvImageMemoryAllocationError) }
-            var scaleBuf = vImage_Buffer(data: scaled.withUnsafeBytes { $0.baseAddress },
+        guard let scaledPtr = scaled.withUnsafeBytes({ $0.baseAddress }) else { return nil }
+        var permuteOK = false
+        out.withUnsafeMutableBytes { ob in
+            guard let obPtr = ob.baseAddress else { return }
+            var scaleBuf = vImage_Buffer(data: scaledPtr,
                                          height: vImagePixelCount(th),
                                          width: vImagePixelCount(tw),
                                          rowBytes: dstRow)
@@ -298,9 +301,9 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
                                        height: vImagePixelCount(th),
                                        width: vImagePixelCount(tw),
                                        rowBytes: dstRow)
-            return vImagePermuteChannels_ARGB8888(&outBuf, &scaleBuf, permute, vImage_Flags(kvImageNoFlags))
+            permuteOK = vImagePermuteChannels_ARGB8888(&outBuf, &scaleBuf, permute, vImage_Flags(kvImageNoFlags)) == kvImageNoError
         }
-        guard permuteErr == kvImageNoError else { return nil }
+        guard permuteOK else { return nil }
 
         // 亮度均值自检（采样），用于发现黑帧
         var sum: UInt64 = 0
