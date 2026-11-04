@@ -8,26 +8,29 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
     private let sessionQueue = DispatchQueue(label: "cimbar.camera.session")
     private let frameQueue = DispatchQueue(label: "cimbar.camera.frames")
     private var decoder: CimbarDecoder?
+    private var previewLayer = AVCaptureVideoPreviewLayer()
 
     private var isRunning = false
     private var framePending = false
     private var frameCount = 0
     private var frameCheckTimer: Timer?
 
+    private var logLines: [String] = []
+
     private let statusLabel = UILabel()
     private let progressView = UIProgressView(progressViewStyle: .default)
     private let progressLabel = UILabel()
-    private let logLabel = UILabel()
+    private let logView = UITextView()
     private let toggleButton = UIButton(type: .system)
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
 
-        let preview = AVCaptureVideoPreviewLayer(session: session)
-        preview.videoGravity = .resizeAspectFill
-        preview.frame = view.bounds
-        view.layer.addSublayer(preview)
+        previewLayer = AVCaptureVideoPreviewLayer(session: session)
+        previewLayer.videoGravity = .resizeAspectFill
+        previewLayer.frame = view.bounds
+        view.layer.addSublayer(previewLayer)
 
         // 隐藏的解码 WKWebView：1×1、近乎透明，不遮挡相机预览；引擎只做计算
         let dec = CimbarDecoder()
@@ -39,7 +42,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
 
         // 先接回调，再启动引擎（保证每一行日志都能显示）
         dec.onLog = { [weak self] text in
-            DispatchQueue.main.async { self?.logLabel.text = text }
+            DispatchQueue.main.async { self?.appendLog(text) }
         }
         dec.onProgress = { [weak self] fraction in
             DispatchQueue.main.async {
@@ -56,6 +59,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
             }
         }
         dec.start()
+        appendLog("等待解码引擎就绪…")
 
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -68,6 +72,24 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
             }
         default:
             showPermissionHint()
+        }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        // 相机预览跟随视图尺寸（旋转、第一次布局都会触发）
+        previewLayer.frame = view.bounds
+    }
+
+    // MARK: - 日志
+
+    private func appendLog(_ text: String) {
+        logLines.append(text)
+        if logLines.count > 200 { logLines.removeFirst(logLines.count - 200) }
+        logView.text = logLines.joined(separator: "\n")
+        let bottom = NSRange(location: (logView.text as NSString).length - 1, length: 1)
+        if bottom.location != NSNotFound {
+            logView.scrollRangeToVisible(bottom)
         }
     }
 
@@ -96,7 +118,9 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
                     device.focusMode = .continuousAutoFocus
                     device.unlockForConfiguration()
                 }
-            } catch { }
+            } catch {
+                DispatchQueue.main.async { self.appendLog("相机配置失败: \(error.localizedDescription)") }
+            }
         }
     }
 
@@ -117,9 +141,9 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
             guard let self = self else { return }
             DispatchQueue.main.async {
                 if self.frameCount > 0 {
-                    self.decoder?.onLog?("相机帧已送达 \(self.frameCount) 帧")
+                    self.appendLog("相机帧已送达 \(self.frameCount) 帧")
                 } else {
-                    self.decoder?.onLog?("警告: 相机无帧输出")
+                    self.appendLog("警告: 相机无帧输出")
                 }
             }
         }
@@ -213,11 +237,14 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         progressLabel.textAlignment = .center
         progressLabel.text = "尚未开始"
 
-        logLabel.textColor = UIColor(white: 1, alpha: 0.85)
-        logLabel.font = .systemFont(ofSize: 13)
-        logLabel.textAlignment = .center
-        logLabel.numberOfLines = 3
-        logLabel.text = "解码引擎加载中…"
+        logView.isEditable = false
+        logView.isScrollEnabled = true
+        logView.backgroundColor = UIColor(white: 0, alpha: 0.35)
+        logView.textColor = UIColor(white: 1, alpha: 0.9)
+        logView.font = .systemFont(ofSize: 12)
+        logView.textContainerInset = UIEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
+        logView.layer.cornerRadius = 10
+        logView.text = "解码引擎加载中…"
 
         toggleButton.setTitle("开始接收", for: .normal)
         toggleButton.setTitleColor(.black, for: .normal)
@@ -226,7 +253,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         toggleButton.layer.cornerRadius = 22
         toggleButton.addTarget(self, action: #selector(toggle(_:)), for: .touchUpInside)
 
-        [statusLabel, progressView, progressLabel, logLabel, toggleButton].forEach {
+        [statusLabel, progressView, progressLabel, logView, toggleButton].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview($0)
         }
@@ -243,14 +270,16 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
             progressLabel.topAnchor.constraint(equalTo: progressView.bottomAnchor, constant: 6),
             progressLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
 
-            logLabel.bottomAnchor.constraint(equalTo: toggleButton.topAnchor, constant: -18),
-            logLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
-            logLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            logView.topAnchor.constraint(equalTo: progressLabel.bottomAnchor, constant: 10),
+            logView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            logView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            logView.heightAnchor.constraint(equalToConstant: 170),
 
-            toggleButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -24),
+            toggleButton.topAnchor.constraint(equalTo: logView.bottomAnchor, constant: 14),
             toggleButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             toggleButton.widthAnchor.constraint(equalToConstant: 180),
-            toggleButton.heightAnchor.constraint(equalToConstant: 44)
+            toggleButton.heightAnchor.constraint(equalToConstant: 44),
+            toggleButton.bottomAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -18)
         ])
     }
 }
