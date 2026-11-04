@@ -1,0 +1,36 @@
+name: Build Unsigned IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 生成工程并编译（免签名）
+        run: |
+          xcodegen generate
+          xcodebuild -project CimbarFileCopy.xcodeproj -scheme CimbarFileCopy \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: 打包 IPA
+        run: |
+          mkdir -p Payload
+          cp -R "build/Build/Products/Release-iphoneos/CimbarFileCopy.app" Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload CimbarFileCopy.ipa
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: CimbarFileCopy-unsigned-ipa
+          path: CimbarFileCopy.ipa
