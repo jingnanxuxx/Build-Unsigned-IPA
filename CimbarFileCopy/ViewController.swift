@@ -26,6 +26,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
     private let crosshairView = UIView()        // 瞄准准星框（条码需填满此框）
     private var crosshairAspect: CGFloat = 1.0
     private let crosshairLayer = CAShapeLayer()
+    private var didLogFormat = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -217,6 +218,15 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let rgba = Self.convertToRgba(pixelBuffer: pixelBuffer) else { return }
 
+        if !didLogFormat {
+            didLogFormat = true
+            let fmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
+            appendLog("像素格式: \(fmt) (BGRA=1111970369)")
+        }
+        if frameCount % 60 == 0 {
+            appendLog("帧\(frameCount) 亮度均值 \(rgba.mean) (0=全黑)")
+        }
+
         framePending = true
         frameCount += 1
         let b64 = rgba.data.base64EncodedString()
@@ -242,8 +252,10 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         return UIImage(cgImage: cg)
     }
 
-    /// BGRA 像素 → 缩小到短边约 360px 的 RGBA 像素（与网页端 16:9 采集口径一致）
-    private static func convertToRgba(pixelBuffer: CVPixelBuffer) -> (data: Data, width: Int, height: Int)? {
+    /// BGRA 像素 → 缩小到短边 540px 的 RGBA 像素（与网页端 16:9 采集口径一致）
+    /// 注意：vImage 的缓冲指针必须用 withUnsafeMutableBytes 显式取得元素存储区，
+    /// 不能写 vImage_Buffer(data: &array, ...)（那拿不到数组元素区，会产出全黑帧）。
+    private static func convertToRgba(pixelBuffer: CVPixelBuffer) -> (data: Data, width: Int, height: Int, mean: UInt64)? {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
@@ -264,23 +276,44 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
                                 rowBytes: CVPixelBufferGetBytesPerRow(pixelBuffer))
 
         var scaled = [UInt8](repeating: 0, count: tw * th * 4)
-        var scaleBuf = vImage_Buffer(data: &scaled,
-                                     height: vImagePixelCount(th),
-                                     width: vImagePixelCount(tw),
-                                     rowBytes: dstRow)
-        let scaleErr = vImageScale_ARGB8888(&src, &scaleBuf, nil, vImage_Flags(kvImageHighQualityResampling))
+        let scaleErr = scaled.withUnsafeMutableBytes { (sb: UnsafeMutableRawBufferPointer) -> vImage_Error in
+            guard let sbPtr = sb.baseAddress else { return vImage_Error(kvImageMemoryAllocationError) }
+            var scaleBuf = vImage_Buffer(data: sbPtr,
+                                         height: vImagePixelCount(th),
+                                         width: vImagePixelCount(tw),
+                                         rowBytes: dstRow)
+            return vImageScale_ARGB8888(&src, &scaleBuf, nil, vImage_Flags(kvImageHighQualityResampling))
+        }
         guard scaleErr == kvImageNoError else { return nil }
 
         var out = [UInt8](repeating: 0, count: tw * th * 4)
         let permute: [UInt8] = [2, 1, 0, 3]
-        var outBuf = vImage_Buffer(data: &out,
-                                   height: vImagePixelCount(th),
-                                   width: vImagePixelCount(tw),
-                                   rowBytes: dstRow)
-        let permuteErr = vImagePermuteChannels_ARGB8888(&outBuf, &scaleBuf, permute, vImage_Flags(kvImageNoFlags))
+        let permuteErr = out.withUnsafeMutableBytes { (ob: UnsafeMutableRawBufferPointer) -> vImage_Error in
+            guard let obPtr = ob.baseAddress else { return vImage_Error(kvImageMemoryAllocationError) }
+            var scaleBuf = vImage_Buffer(data: scaled.withUnsafeBytes { $0.baseAddress },
+                                         height: vImagePixelCount(th),
+                                         width: vImagePixelCount(tw),
+                                         rowBytes: dstRow)
+            var outBuf = vImage_Buffer(data: obPtr,
+                                       height: vImagePixelCount(th),
+                                       width: vImagePixelCount(tw),
+                                       rowBytes: dstRow)
+            return vImagePermuteChannels_ARGB8888(&outBuf, &scaleBuf, permute, vImage_Flags(kvImageNoFlags))
+        }
         guard permuteErr == kvImageNoError else { return nil }
 
-        return (Data(out), tw, th)
+        // 亮度均值自检（采样），用于发现黑帧
+        var sum: UInt64 = 0
+        var n: UInt64 = 0
+        var i = 0
+        while i < out.count {
+            sum += UInt64(out[i])
+            n += 1
+            i += 64
+        }
+        let mean: UInt64 = n > 0 ? sum / n : 0
+
+        return (Data(out), tw, th, mean)
     }
 
     // MARK: - UI
