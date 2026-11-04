@@ -7,10 +7,12 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
     private let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "cimbar.camera.session")
     private let frameQueue = DispatchQueue(label: "cimbar.camera.frames")
-    private let decoder = CimbarDecoder()
+    private var decoder: CimbarDecoder?
 
     private var isRunning = false
     private var framePending = false
+    private var frameCount = 0
+    private var frameCheckTimer: Timer?
 
     private let statusLabel = UILabel()
     private let progressView = UIProgressView(progressViewStyle: .default)
@@ -27,23 +29,25 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         preview.frame = view.bounds
         view.layer.addSublayer(preview)
 
-        // 隐藏的 WKWebView：只作解码计算，不渲染相机画面
-        view.addSubview(decoder.webView)
-        decoder.webView.frame = .zero
-        decoder.webView.isHidden = true
+        // 隐藏的解码 WKWebView：1×1、近乎透明，不遮挡相机预览；引擎只做计算
+        let dec = CimbarDecoder()
+        decoder = dec
+        view.addSubview(dec.webView)
+        dec.webView.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
 
         setupUI()
 
-        decoder.onLog = { [weak self] text in
+        // 先接回调，再启动引擎（保证每一行日志都能显示）
+        dec.onLog = { [weak self] text in
             DispatchQueue.main.async { self?.logLabel.text = text }
         }
-        decoder.onProgress = { [weak self] fraction in
+        dec.onProgress = { [weak self] fraction in
             DispatchQueue.main.async {
                 self?.progressView.progress = Float(fraction)
                 self?.progressLabel.text = String(format: "已接收 %.0f%%", fraction * 100)
             }
         }
-        decoder.onFile = { [weak self] url, name in
+        dec.onFile = { [weak self] url, name in
             DispatchQueue.main.async {
                 let avc = UIActivityViewController(activityItems: [url], applicationActivities: nil)
                 avc.popoverPresentationController?.sourceView = self?.view
@@ -51,6 +55,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
                 self?.present(avc, animated: true, completion: nil)
             }
         }
+        dec.start()
 
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -101,14 +106,31 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
 
     private func start() {
         isRunning = true
+        frameCount = 0
         sessionQueue.async { [weak self] in self?.session.startRunning() }
         toggleButton.setTitle("停止接收", for: .normal)
         statusLabel.text = "对准电脑屏幕上的彩色条码，保持 15–40cm"
+
+        // 3 秒后检查相机是否真的在出帧
+        frameCheckTimer?.invalidate()
+        let t = Timer(timeInterval: 3.0, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                if self.frameCount > 0 {
+                    self.decoder?.onLog?("相机帧已送达 \(self.frameCount) 帧")
+                } else {
+                    self.decoder?.onLog?("警告: 相机无帧输出")
+                }
+            }
+        }
+        frameCheckTimer = t
+        RunLoop.main.add(t, forMode: .common)
     }
 
     private func stop() {
         isRunning = false
         framePending = false
+        frameCheckTimer?.invalidate()
         sessionQueue.async { [weak self] in self?.session.stopRunning() }
         toggleButton.setTitle("开始接收", for: .normal)
     }
@@ -127,8 +149,9 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
               let rgba = Self.convertToRgba(pixelBuffer: pixelBuffer) else { return }
 
         framePending = true
+        frameCount += 1
         let b64 = rgba.data.base64EncodedString()
-        decoder.feedFrame(base64: b64, width: rgba.width, height: rgba.height) { [weak self] in
+        decoder?.feedFrame(base64: b64, width: rgba.width, height: rgba.height) { [weak self] in
             self?.framePending = false
         }
     }
@@ -143,7 +166,6 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         let srcH = CVPixelBufferGetHeight(pixelBuffer)
         guard srcW > 0, srcH > 0 else { return nil }
 
-        // 短边 -> 360，长边等比（横屏 1280x720 -> 640x360；竖屏输出 -> 360x640）
         let shortSide = min(srcW, srcH)
         let scale = 360.0 / Double(shortSide)
         let tw = max(1, Int((Double(srcW) * scale).rounded()))
@@ -163,7 +185,6 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         let scaleErr = vImageScale_ARGB8888(&src, &scaleBuf, nil, vImage_Flags(kvImageHighQualityResampling))
         guard scaleErr == kvImageNoError else { return nil }
 
-        // BGRA -> RGBA（vImage 通道序：A,R,G,B；BGRA 内存序：B,G,R,A）
         var out = [UInt8](repeating: 0, count: tw * th * 4)
         let permute: [UInt8] = [2, 1, 0, 3]
         var outBuf = vImage_Buffer(data: &out,
