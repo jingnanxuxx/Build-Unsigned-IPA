@@ -18,10 +18,6 @@ targets:
       - path: CimbarFileCopy
         excludes:
           - Resources
-    resources:
-      - path: CimbarFileCopy/Resources/decoder.html
-      - path: CimbarFileCopy/Resources/cimbar_js.js
-      - path: CimbarFileCopy/Resources/cimbar_js.wasm
     info:
       path: CimbarFileCopy/Info.plist
       properties:

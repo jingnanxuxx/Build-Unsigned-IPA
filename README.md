@@ -17,13 +17,11 @@ CimbarFileCopy/
 ├── README.md
 └── CimbarFileCopy/
     ├── AppDelegate.swift             ← 入口
-    ├── ViewController.swift          ← 相机采集 + 界面（AVFoundation + Accelerate）
-    ├── CimbarDecoder.swift           ← WKWebView 解码引擎宿主桥
+    ├── ViewController.swift          ← 相机采集/预览/日志/进度界面（AVFoundation + Accelerate）
+    ├── CimbarDecoder.swift           ← WKWebView 解码引擎宿主（loadHTMLString 内嵌引擎 + JS 探针）
+    ├── DecoderEmbed.swift            ← 解码引擎 HTML 的 base64 内嵌（3.5MB，构建唯一来源）
     ├── Assets.xcassets/              ← 应用图标（AppIcon.appiconset）
-    └── Resources/
-        ├── decoder.html              ← 自包含解码引擎（wasm 与 cimbar_js 全部内联，无子资源加载）
-        ├── cimbar_js.js              ← 解码引擎源文件（已内联进 decoder.html，保留备份）
-        └── cimbar_js.wasm            ← 解码引擎 wasm（已内联进 decoder.html，保留备份）
+    └── Resources/                    ← 引擎源文件备份（已内嵌进 DecoderEmbed.swift，不参与打包）
 ```
 
 ## 一、上传 GitHub（重要：内容放根目录，不要嵌套）
@@ -69,11 +67,12 @@ CimbarFileCopy/
 - 相机：AVCaptureSession 720p → BGRA → vImage 缩放（短边 360）+ 通道置换为 RGBA；
 - 解码：隐藏 WKWebView 加载 decoder.html + cimbar_js 引擎，每帧 base64 传入，
   模式自动轮询（Bu/B/Bm/4C），与网页端 recv 逻辑一致；
-- 引擎加载：decoder.html 为**自包含单文件**（wasm base64 与 cimbar_js 全部内联），
-  不发起任何子资源/文件/网络请求，杜绝 wasm 或脚本加载失败导致引擎不初始化；
-  App 内置 2 秒 JS 探针（不依赖 JS 主动上报）与相机帧计数，
-  日志会按阶段打印：资源检查 OK → 加载 decoder.html → 页面已加载 → wasm 已解码 →
-  页面已加载(探针) → 引擎就绪 → 相机帧已送达 N 帧，真机遇到问题可据此精确定位到具体环节；
+- 引擎加载：decoder.html（自包含：wasm 与 cimbar_js 全内联）以 **base64 内嵌进
+  DecoderEmbed.swift**，运行时解码后由 `loadHTMLString` 直接加载——**不依赖 Bundle 资源打包**，
+  从根源杜绝"资源未进 App 包导致引擎不启动"；
+  App 内置 2 秒 JS 探针（检查 CimbarBridge/Module 是否真实执行，规避空页面误报）与相机帧计数，
+  日志按阶段打印：内嵌引擎已解出 → 页面已加载 → wasm 已解码 → 引擎页面已执行(探针) →
+  引擎就绪 → 解码引擎就绪 → 相机帧已送达 N 帧，真机遇到问题可据此精确定位到具体环节；
 - 完成：fountain 汇流 → 文件名/大小 → zstd 分块解压 → 系统分享面板。
 
 ## 许可
