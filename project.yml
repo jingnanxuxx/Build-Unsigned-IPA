@@ -22,7 +22,6 @@ targets:
       - path: CimbarFileCopy/Resources/decoder.html
       - path: CimbarFileCopy/Resources/cimbar_js.js
       - path: CimbarFileCopy/Resources/cimbar_js.wasm
-      - path: CimbarFileCopy/Resources/wasm_b64.js
     info:
       path: CimbarFileCopy/Info.plist
       properties:

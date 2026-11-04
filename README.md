@@ -21,10 +21,9 @@ CimbarFileCopy/
     ├── CimbarDecoder.swift           ← WKWebView 解码引擎宿主桥
     ├── Assets.xcassets/              ← 应用图标（AppIcon.appiconset）
     └── Resources/
-        ├── decoder.html              ← 解码桥接脚本（wasm 内嵌加载）
-        ├── wasm_b64.js               ← wasm 的 base64 内嵌（不再走文件/网络加载）
-        ├── cimbar_js.js              ← 解码引擎（来自原 IPA，libcimbar 构建产物）
-        └── cimbar_js.wasm            ← 解码引擎 wasm
+        ├── decoder.html              ← 自包含解码引擎（wasm 与 cimbar_js 全部内联，无子资源加载）
+        ├── cimbar_js.js              ← 解码引擎源文件（已内联进 decoder.html，保留备份）
+        └── cimbar_js.wasm            ← 解码引擎 wasm（已内联进 decoder.html，保留备份）
 ```
 
 ## 一、上传 GitHub（重要：内容放根目录，不要嵌套）
@@ -70,10 +69,11 @@ CimbarFileCopy/
 - 相机：AVCaptureSession 720p → BGRA → vImage 缩放（短边 360）+ 通道置换为 RGBA；
 - 解码：隐藏 WKWebView 加载 decoder.html + cimbar_js 引擎，每帧 base64 传入，
   模式自动轮询（Bu/B/Bm/4C），与网页端 recv 逻辑一致；
-- 引擎加载：wasm 以 base64 内嵌（wasm_b64.js → Module.wasmBinary），
-  不依赖 WKWebView 的 file:// 文件请求，杜绝 wasm 加载失败导致引擎不初始化；
-  App 内日志会按阶段打印：资源检查 OK → 页面已加载 → wasm 已解码 → 页面加载完成 →
-  解码引擎就绪，真机遇到问题可据此定位到具体环节；
+- 引擎加载：decoder.html 为**自包含单文件**（wasm base64 与 cimbar_js 全部内联），
+  不发起任何子资源/文件/网络请求，杜绝 wasm 或脚本加载失败导致引擎不初始化；
+  App 内置 2 秒 JS 探针（不依赖 JS 主动上报）与相机帧计数，
+  日志会按阶段打印：资源检查 OK → 加载 decoder.html → 页面已加载 → wasm 已解码 →
+  页面已加载(探针) → 引擎就绪 → 相机帧已送达 N 帧，真机遇到问题可据此精确定位到具体环节；
 - 完成：fountain 汇流 → 文件名/大小 → zstd 分块解压 → 系统分享面板。
 
 ## 许可
