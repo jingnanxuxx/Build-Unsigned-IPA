@@ -221,10 +221,15 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         if !didLogFormat {
             didLogFormat = true
             let fmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
-            appendLog("像素格式: \(fmt) (BGRA=1111970369)")
+            DispatchQueue.main.async { [weak self] in
+                self?.appendLog("像素格式: \(fmt) (BGRA=1111970369)")
+            }
         }
         if frameCount % 60 == 0 {
-            appendLog("帧\(frameCount) 亮度均值 \(rgba.mean) (0=全黑)")
+            let mean = rgba.mean
+            DispatchQueue.main.async { [weak self] in
+                self?.appendLog("帧\(self?.frameCount ?? 0) 亮度均值 \(mean) (0=全黑)")
+            }
         }
 
         framePending = true
