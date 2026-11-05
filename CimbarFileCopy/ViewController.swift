@@ -11,8 +11,10 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
     private var previewLayer = AVCaptureVideoPreviewLayer()
 
     private var isRunning = false
-    private var framePending = false
+    private var inflight = 0                 // 在途帧数（允许重叠，提升帧率）
+    private let maxInflight = 2
     private var frameCount = 0
+    private var fpsMark = Date()
     private var frameCheckTimer: Timer?
 
     private var logLines: [String] = []
@@ -173,6 +175,8 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
     private func start() {
         isRunning = true
         frameCount = 0
+        fpsMark = Date()
+        inflight = 0
         sessionQueue.async { [weak self] in self?.session.startRunning() }
         toggleButton.setTitle("停止接收", for: .normal)
         statusLabel.text = "把彩色条码放大到填满绿色方框，保持 15–40cm"
@@ -199,7 +203,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
 
     private func stop() {
         isRunning = false
-        framePending = false
+        frameQueue.async { [weak self] in self?.inflight = 0 }
         frameCheckTimer?.invalidate()
         sessionQueue.async { [weak self] in self?.session.stopRunning() }
         toggleButton.setTitle("开始接收", for: .normal)
@@ -214,7 +218,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
-        guard isRunning, !framePending,
+        guard isRunning, inflight < maxInflight,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let rgba = Self.convertToRgba(pixelBuffer: pixelBuffer) else { return }
 
@@ -227,19 +231,33 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         }
         if frameCount % 60 == 0 {
             let mean = rgba.mean
+            let srcMean = rgba.srcMean
             DispatchQueue.main.async { [weak self] in
-                self?.appendLog("帧\(self?.frameCount ?? 0) 亮度均值 \(mean) (0=全黑)")
+                self?.appendLog("帧\(self?.frameCount ?? 0) 亮度 源\(srcMean)/输出\(mean)")
             }
         }
 
-        framePending = true
+        inflight += 1
         frameCount += 1
+
+        // 每 30 帧报一次真实帧率
+        if frameCount % 30 == 0 {
+            let elapsed = Date().timeIntervalSince(fpsMark)
+            fpsMark = Date()
+            let fps = elapsed > 0 ? Double(30) / elapsed : 0
+            let fpsText = String(format: "%.1f", fps)
+            DispatchQueue.main.async { [weak self] in
+                self?.appendLog("帧率 \(fpsText) fps")
+            }
+        }
+
         let b64 = rgba.data.base64EncodedString()
         if frameCount % 8 == 0, let img = Self.imageFromRgba(rgba.data, rgba.width, rgba.height) {
             DispatchQueue.main.async { [weak self] in self?.enginePreview.image = img }
         }
         decoder?.feedFrame(base64: b64, width: rgba.width, height: rgba.height) { [weak self] in
-            self?.framePending = false
+            guard let self = self else { return }
+            self.frameQueue.async { self.inflight -= 1 }
         }
     }
 
@@ -258,30 +276,47 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
     }
 
     /// BGRA 像素 → 缩小到短边 540px 的 RGBA 像素（与网页端 16:9 采集口径一致）
-    /// 注意：vImage 的缓冲指针必须用 withUnsafeMutableBytes 显式取得元素存储区，
-    /// 不能写 vImage_Buffer(data: &array, ...)（那拿不到数组元素区，会产出全黑帧）。
-    private static func convertToRgba(pixelBuffer: CVPixelBuffer) -> (data: Data, width: Int, height: Int, mean: UInt64)? {
+    /// 注意：vImagePermuteChannels_ARGB8888 的参数顺序是 (src, dest, permuteMap, flags)。
+    /// 之前写成 (dest, src)，目标缓冲区永远不被写入 → 全黑帧。这里改为纯字节交换，彻底消除歧义。
+    private static func convertToRgba(pixelBuffer: CVPixelBuffer) -> (data: Data, width: Int, height: Int, mean: UInt64, srcMean: UInt64)? {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
         guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
         let srcW = CVPixelBufferGetWidth(pixelBuffer)
         let srcH = CVPixelBufferGetHeight(pixelBuffer)
-        guard srcW > 0, srcH > 0 else { return nil }
+        let srcRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        guard srcW > 1, srcH > 1, srcRow > 0 else { return nil }
+
+        let srcPtr = base.assumingMemoryBound(to: UInt8.self)
+
+        // 源亮度（采样 BGRA 三通道）：区分“相机给的就是黑帧”还是“转换环节出错”
+        var srcSum: UInt64 = 0
+        var srcN: UInt64 = 0
+        var sy = 0
+        while sy < srcH {
+            var sx = 0
+            while sx < srcW {
+                let off = sy * srcRow + sx * 4
+                srcSum += UInt64(srcPtr[off]) + UInt64(srcPtr[off + 1]) + UInt64(srcPtr[off + 2])
+                srcN += 3
+                sx += 16
+            }
+            sy += 8
+        }
+        let srcMean: UInt64 = srcN > 0 ? srcSum / srcN : 0
 
         let shortSide = min(srcW, srcH)
         let scale = 540.0 / Double(shortSide)
         let tw = max(1, Int((Double(srcW) * scale).rounded()))
         let th = max(1, Int((Double(srcH) * scale).rounded()))
         let dstRow = tw * 4
+        let count = tw * th * 4
 
         var src = vImage_Buffer(data: base,
                                 height: vImagePixelCount(srcH),
                                 width: vImagePixelCount(srcW),
-                                rowBytes: CVPixelBufferGetBytesPerRow(pixelBuffer))
-
-        // 目标缓冲用原生指针手工分配：保证 vImage 写进真实连续内存（不用 &数组、不用 withUnsafe，避免黑帧与编译器问题）
-        let count = tw * th * 4
+                                rowBytes: srcRow)
 
         let scaledPtr = UnsafeMutableRawPointer.allocate(byteCount: count, alignment: 16)
         defer { scaledPtr.deallocate() }
@@ -291,29 +326,31 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
                                      rowBytes: dstRow)
         guard vImageScale_ARGB8888(&src, &scaleBuf, nil, vImage_Flags(kvImageHighQualityResampling)) == kvImageNoError else { return nil }
 
-        let outPtr = UnsafeMutableRawPointer.allocate(byteCount: count, alignment: 16)
-        defer { outPtr.deallocate() }
-        var outBuf = vImage_Buffer(data: outPtr,
-                                   height: vImagePixelCount(th),
-                                   width: vImagePixelCount(tw),
-                                   rowBytes: dstRow)
-        let permute: [UInt8] = [2, 1, 0, 3]
-        guard vImagePermuteChannels_ARGB8888(&outBuf, &scaleBuf, permute, vImage_Flags(kvImageNoFlags)) == kvImageNoError else { return nil }
-
-        let outData = Data(bytes: outPtr, count: count)
-
-        // 亮度均值自检（采样），用于发现黑帧
-        var sum: UInt64 = 0
-        var n: UInt64 = 0
+        // 缩放结果是 BGRA，就地换成 RGBA（纯字节操作，不依赖任何 vImage 参数顺序）
+        let outPtr = scaledPtr.assumingMemoryBound(to: UInt8.self)
         var i = 0
         while i < count {
-            sum += UInt64(outData[i])
+            let b = outPtr[i]          // B
+            outPtr[i] = outPtr[i + 2]  // B ← R
+            outPtr[i + 2] = b          // R ← B
+            outPtr[i + 3] = 255        // A
+            i += 4
+        }
+
+        let outData = Data(bytes: scaledPtr, count: count)
+
+        // 输出亮度均值（采样）
+        var sum: UInt64 = 0
+        var n: UInt64 = 0
+        var k = 0
+        while k < count {
+            sum += UInt64(outData[k])
             n += 1
-            i += 64
+            k += 64
         }
         let mean: UInt64 = n > 0 ? sum / n : 0
 
-        return (outData, tw, th, mean)
+        return (outData, tw, th, mean, srcMean)
     }
 
     // MARK: - UI
