@@ -155,11 +155,19 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
                 guard self.session.canAddOutput(output) else { return }
                 self.session.addOutput(output)
 
-                self.session.sessionPreset = .hd1280x720
+                self.session.sessionPreset = .hd1920x1080
 
                 if device.isFocusModeSupported(.continuousAutoFocus) {
                     try? device.lockForConfiguration()
                     device.focusMode = .continuousAutoFocus
+                    if device.isExposureModeSupported(.continuousAutoExposure) {
+                        device.exposureMode = .continuousAutoExposure
+                    }
+                    // 光学/数字变焦：条码每格平均到的像素成倍增加，是提升命中率最直接的一招
+                    let want: CGFloat = 1.6
+                    if device.maxAvailableVideoZoomFactor >= want {
+                        device.videoZoomFactor = want
+                    }
                     device.unlockForConfiguration()
                 }
             } catch {
@@ -179,7 +187,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         inflight = 0
         sessionQueue.async { [weak self] in self?.session.startRunning() }
         toggleButton.setTitle("停止接收", for: .normal)
-        statusLabel.text = "把彩色条码放大到填满绿色方框，保持 15–40cm"
+        statusLabel.text = "让彩色条码完整落在绿色方框内（约 25–50cm，可退远一点）"
 
         // 3 秒后检查相机是否真的在出帧
         frameCheckTimer?.invalidate()
@@ -225,8 +233,12 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         if !didLogFormat {
             didLogFormat = true
             let fmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
+            let srcW = CVPixelBufferGetWidth(pixelBuffer)
+            let srcH = CVPixelBufferGetHeight(pixelBuffer)
+            let outW = rgba.width
+            let outH = rgba.height
             DispatchQueue.main.async { [weak self] in
-                self?.appendLog("像素格式: \(fmt) (BGRA=1111970369)")
+                self?.appendLog("像素格式: \(fmt) (BGRA=1111970369) 源\(srcW)x\(srcH) → 送入\(outW)x\(outH)")
             }
         }
         if frameCount % 60 == 0 {
@@ -275,7 +287,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         return UIImage(cgImage: cg)
     }
 
-    /// BGRA 像素 → 缩小到短边 540px 的 RGBA 像素（与网页端 16:9 采集口径一致）
+    /// BGRA 像素 → 缩小到短边 720px 的 RGBA 像素（对齐网页版 1080p 采集口径，约每格 6~7 像素）
     /// 注意：vImagePermuteChannels_ARGB8888 的参数顺序是 (src, dest, permuteMap, flags)。
     /// 之前写成 (dest, src)，目标缓冲区永远不被写入 → 全黑帧。这里改为纯字节交换，彻底消除歧义。
     private static func convertToRgba(pixelBuffer: CVPixelBuffer) -> (data: Data, width: Int, height: Int, mean: UInt64, srcMean: UInt64)? {
@@ -307,7 +319,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         let srcMean: UInt64 = srcN > 0 ? srcSum / srcN : 0
 
         let shortSide = min(srcW, srcH)
-        let scale = 540.0 / Double(shortSide)
+        let scale = min(1.0, 720.0 / Double(shortSide))
         let tw = max(1, Int((Double(srcW) * scale).rounded()))
         let th = max(1, Int((Double(srcH) * scale).rounded()))
         let dstRow = tw * 4
