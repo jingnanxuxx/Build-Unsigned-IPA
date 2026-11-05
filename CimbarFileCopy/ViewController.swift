@@ -27,8 +27,6 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
     private let enginePreview = UIImageView()   // 引擎实时视角小窗（显示送进引擎的帧）
     private let crosshairView = UIView()        // 瞄准准星框（条码需填满此框）
     private var crosshairAspect: CGFloat = 1.0
-    private var guideBox: CGRect = .zero       // 解码区域（视图坐标，已外扩安全边）
-    private var lastViewSize: CGSize = .zero
     private let crosshairLayer = CAShapeLayer()
     private var didLogFormat = false
 
@@ -125,10 +123,6 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
             path.addLine(to: CGPoint(x: p.x, y: p.y + (verDown ? len : -len)))
         }
         crosshairLayer.path = path.cgPath
-
-        // 送进引擎的正是这块区域：向外多留 10%，避免条码刚好压线被切掉
-        guideBox = rect.insetBy(dx: -rect.width * 0.10, dy: -rect.height * 0.10)
-        lastViewSize = bounds.size
     }
 
     // MARK: - 日志
@@ -234,9 +228,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
                        from connection: AVCaptureConnection) {
         guard isRunning, inflight < maxInflight,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
-              let rgba = Self.convertToRgba(pixelBuffer: pixelBuffer,
-                                            guide: guideBox,
-                                            viewSize: lastViewSize) else { return }
+              let rgba = Self.convertToRgba(pixelBuffer: pixelBuffer) else { return }
 
         if !didLogFormat {
             didLogFormat = true
@@ -295,12 +287,10 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         return UIImage(cgImage: cg)
     }
 
-    /// BGRA → 只裁准星框覆盖的那块，按原生像素换成 RGBA（不缩放，条码每格约 810px，是整帧缩放时的 1.5 倍）
+    /// BGRA → 画面正中正方形（边长=短边）→ 原生像素换通道成 RGBA，不缩放
     /// 注意：vImagePermuteChannels_ARGB8888 的参数顺序是 (src, dest, permuteMap, flags)，
     /// 之前写成 (dest, src) 会让目标缓冲永远不被写入 → 全黑帧。这里改为纯字节交换，彻底消除歧义。
-    private static func convertToRgba(pixelBuffer: CVPixelBuffer,
-                                      guide: CGRect,
-                                      viewSize: CGSize) -> (data: Data, width: Int, height: Int, mean: UInt64, srcMean: UInt64)? {
+    private static func convertToRgba(pixelBuffer: CVPixelBuffer) -> (data: Data, width: Int, height: Int, mean: UInt64, srcMean: UInt64)? {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
@@ -310,23 +300,13 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         let srcRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         guard srcW > 1, srcH > 1, srcRow > 0 else { return nil }
 
-        // 视图坐标下的准星框 → 缓冲区坐标（预览是 resizeAspectFill：等比铺满、居中裁切）
-        var cx = 0, cy = 0, cw = srcW, ch = srcH
-        if guide.width > 8, guide.height > 8, viewSize.width > 0, viewSize.height > 0 {
-            let s = max(viewSize.width / CGFloat(srcW), viewSize.height / CGFloat(srcH))
-            let ox = (viewSize.width - CGFloat(srcW) * s) / 2
-            let oy = (viewSize.height - CGFloat(srcH) * s) / 2
-            let x0 = max(0, ((guide.minX - ox) / s).rounded())
-            let y0 = max(0, ((guide.minY - oy) / s).rounded())
-            let x1 = min(CGFloat(srcW), ((guide.maxX - ox) / s).rounded())
-            let y1 = min(CGFloat(srcH), ((guide.maxY - oy) / s).rounded())
-            let nx1 = max(x0 + 8, x1)
-            let ny1 = max(y0 + 8, y1)
-            cx = Int(x0)
-            cy = Int(y0)
-            cw = Int(nx1 - x0)
-            ch = Int(ny1 - y0)
-        }
+        // 取画面正中的正方形（边长 = 短边）：横向用满全宽，绝不切掉条码角标；
+        // 原生像素直送、不缩放，条码每格的像素数达到 1080p 采集的上限。
+        let side = min(srcW, srcH)
+        let cx = (srcW - side) / 2
+        let cy = (srcH - side) / 2
+        let cw = side
+        let ch = side
 
         let srcPtr = base.assumingMemoryBound(to: UInt8.self)
 
@@ -346,8 +326,8 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         }
         let srcMean: UInt64 = srcN > 0 ? srcSum / srcN : 0
 
-        // 只有裁剪区超过 900 才缩小（控制单帧体积），否则原生像素直送
-        let maxSide = 900
+        // 只有超过 1080 才缩小（1080p 采集时等于不缩放）
+        let maxSide = 1080
         let longest = max(cw, ch)
         let shrink = longest > maxSide ? Double(maxSide) / Double(longest) : 1.0
         let tw = max(1, Int((Double(cw) * shrink).rounded()))
