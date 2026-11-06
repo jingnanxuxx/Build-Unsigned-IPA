@@ -1,6 +1,7 @@
 import UIKit
 import AVFoundation
 import Accelerate
+import Darwin
 
 final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBufferDelegate {
 
@@ -72,6 +73,16 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
                 else if mode == 67 { aspect = 1.413 }    // Bm
                 self?.crosshairAspect = aspect
                 self?.view.setNeedsLayout()
+            }
+        }
+        // 引擎被系统回收或连续失败：立刻停采集，别对着空气喂帧
+        dec.onEngineLost = { [weak self] in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if self.isRunning { self.stop() }
+                self.statusLabel.text = "引擎中断，请点「开始接收」重新开始"
+                self.progressLabel.text = "尚未开始"
+                self.appendLog("已停止采集：引擎不可用，需重新开始")
             }
         }
         dec.start()
@@ -239,6 +250,8 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
             let outH = rgba.height
             DispatchQueue.main.async { [weak self] in
                 self?.appendLog("像素格式: \(fmt) (BGRA=1111970369) 源\(srcW)x\(srcH) → 送入\(outW)x\(outH)")
+                let chunks = (rgba.data.count + CimbarDecoder.chunkBytes - 1) / CimbarDecoder.chunkBytes
+                self?.appendLog("分片投递: 每帧 \(chunks) 段 × 0.38 MB（旧版一次性注入 6.2 MB）")
             }
         }
         if frameCount % 60 == 0 {
@@ -252,25 +265,39 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
         inflight += 1
         frameCount += 1
 
-        // 每 30 帧报一次真实帧率
+        // 每 30 帧报一次真实帧率与本进程物理内存（用来看分片投递有没有把峰值压下来）
         if frameCount % 30 == 0 {
             let elapsed = Date().timeIntervalSince(fpsMark)
             fpsMark = Date()
             let fps = elapsed > 0 ? Double(30) / elapsed : 0
             let fpsText = String(format: "%.1f", fps)
+            let mb = Self.residentMB()
+            let memText = mb > 0 ? String(format: " | 内存 %.1f MB", mb) : ""
             DispatchQueue.main.async { [weak self] in
-                self?.appendLog("帧率 \(fpsText) fps")
+                self?.appendLog("帧率 \(fpsText) fps\(memText)")
             }
         }
 
-        let b64 = rgba.data.base64EncodedString()
         if frameCount % 16 == 0, let img = Self.imageFromRgba(rgba.data, rgba.width, rgba.height) {
             DispatchQueue.main.async { [weak self] in self?.enginePreview.image = img }
         }
-        decoder?.feedFrame(base64: b64, width: rgba.width, height: rgba.height) { [weak self] in
+        decoder?.feedFrame(data: rgba.data, width: rgba.width, height: rgba.height) { [weak self] in
             guard let self = self else { return }
             self.frameQueue.async { self.inflight -= 1 }
         }
+    }
+
+    /// 本进程物理内存（MB）。WKWebView 的 WebContent 是独立进程读不到，
+    /// 这里量的是我们自己持有的 Data / 字符串，正好能证明“大字符串没了”。
+    private static func residentMB() -> Double {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { ptr -> kern_return_t in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { p in
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), p, &count)
+            }
+        }
+        return kr == KERN_SUCCESS ? Double(info.resident_size) / 1_048_576.0 : -1
     }
 
     /// 把送进引擎的 RGBA 帧转成 UIImage，用于实时预览（诊断用）
