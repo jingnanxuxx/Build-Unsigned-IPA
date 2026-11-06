@@ -24,8 +24,16 @@ final class CimbarDecoder: NSObject, WKScriptMessageHandler, WKNavigationDelegat
     private var probeTimer: Timer?
     private var probeState = 0   // 0=未执行 1=页面已执行 2=引擎对象已建 3=引擎就绪
 
-    /// 每段原始像素字节数（整段 base64 后约 0.51MB）；4.66MB 的 1080 帧分成 13 段
-    static let chunkBytes = 384_000
+    /// 每段原始像素字节数（整段 base64 后约 1.04MB）；4.66MB 的 1080 帧正好分成 6 段。
+    /// 段数越少、桥调用越少：13 段 → 6 段省掉一半的 atob 与字符串分配。
+    static let chunkBytes = 777_600
+
+    /// JS 正在跑上一帧时，最新这一帧留在这里等下一轮（旧的待处理帧直接作废）。
+    /// 直接从“丢帧”改成“留一帧”，把白扔掉的帧捞回来——这是本版掉速的主因。
+    private var pendingFrame: (data: Data, width: Int, height: Int, completion: () -> Void)?
+
+    /// 累计被真正丢弃的帧数（只统计 pending 被更新帧挤掉的）。在 frameQueue 上读写。
+    var droppedFrames = 0
 
     // 流式落盘
     private var fileHandle: FileHandle?
@@ -106,21 +114,30 @@ final class CimbarDecoder: NSObject, WKScriptMessageHandler, WKNavigationDelegat
     // MARK: - 分片投递一帧
 
     /// 把一帧 RGBA 像素交给 JS 引擎；completion 在该帧处理完后回调（帧节流信号）。
-    /// JS 是单线程：上一帧的分片序列还没走完就直接丢掉这一帧，避免两次投递的偏移互相踩。
+    /// JS 是单线程，分片序列不能被两帧交错，所以同一时刻只跑一帧；
+    /// 但正在跑的时候不再直接丢新帧，而是把最新一帧留作 pending（由 inflight 做背压）。
     func feedFrame(data: Data, width: Int, height: Int, completion: @escaping () -> Void) {
         guard ready, !dead else {
             completion()
             return
         }
-        guard !busy else {
-            completion()
+        if busy {
+            if let old = pendingFrame {
+                old.completion()          // 更旧的待处理帧作废，释放 inflight
+                droppedFrames += 1
+            }
+            pendingFrame = (data, width, height, completion)
             return
         }
+        start(data: data, width: width, height: height, completion: completion)
+    }
+
+    private func start(data: Data, width: Int, height: Int, completion: @escaping () -> Void) {
         busy = true
         let total = data.count
         evaluate("CimbarBridge.begin(\(width), \(height), \(total));") { [weak self] ok in
             guard let self = self else { completion(); return }
-            guard ok else { self.busy = false; completion(); return }
+            guard ok else { self.finish(completion); return }
             self.pushChunks(data, from: 0, completion: completion)
         }
     }
@@ -128,8 +145,7 @@ final class CimbarDecoder: NSObject, WKScriptMessageHandler, WKNavigationDelegat
     private func pushChunks(_ data: Data, from offset: Int, completion: @escaping () -> Void) {
         if offset >= data.count {
             evaluate("CimbarBridge.end();") { [weak self] _ in
-                self?.busy = false
-                completion()
+                self?.finish(completion)
             }
             return
         }
@@ -138,9 +154,22 @@ final class CimbarDecoder: NSObject, WKScriptMessageHandler, WKNavigationDelegat
         let b64 = piece.base64EncodedString()
         evaluate("CimbarBridge.append(\"\(b64)\");") { [weak self] ok in
             guard let self = self else { completion(); return }
-            guard ok else { self.busy = false; completion(); return }
+            guard ok else { self.finish(completion); return }
             self.pushChunks(data, from: end, completion: completion)
         }
+    }
+
+    /// 一帧收尾：释放 inflight，然后立刻接上排队中的那一帧（别让 JS 空转）。
+    private func finish(_ completion: @escaping () -> Void) {
+        busy = false
+        completion()
+        drainPending()
+    }
+
+    private func drainPending() {
+        guard !busy, !dead, let p = pendingFrame else { return }
+        pendingFrame = nil
+        start(data: p.data, width: p.width, height: p.height, completion: p.completion)
     }
 
     /// 统一入口：失败计数 + 连续失败判定引擎已废（不再对着空气喂帧）。
@@ -166,6 +195,8 @@ final class CimbarDecoder: NSObject, WKScriptMessageHandler, WKNavigationDelegat
         dead = true
         ready = false
         busy = false
+        if let p = pendingFrame { p.completion() }   // 释放 inflight，别让采集端卡在节流上
+        pendingFrame = nil
         onLog?("引擎已失效（\(reason)）：本次传输中断，点「停止接收」再重新开始")
         onEngineLost?()
     }

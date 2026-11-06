@@ -251,7 +251,7 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
             DispatchQueue.main.async { [weak self] in
                 self?.appendLog("像素格式: \(fmt) (BGRA=1111970369) 源\(srcW)x\(srcH) → 送入\(outW)x\(outH)")
                 let chunks = (rgba.data.count + CimbarDecoder.chunkBytes - 1) / CimbarDecoder.chunkBytes
-                self?.appendLog("分片投递: 每帧 \(chunks) 段 × 0.38 MB（旧版一次性注入 6.2 MB）")
+                self?.appendLog("分片投递: 每帧 \(chunks) 段 × 0.76 MB（旧版一次性注入 6.2 MB）")
             }
         }
         if frameCount % 60 == 0 {
@@ -273,8 +273,9 @@ final class ViewController: UIViewController, AVCaptureVideoDataOutputSampleBuff
             let fpsText = String(format: "%.1f", fps)
             let mb = Self.residentMB()
             let memText = mb > 0 ? String(format: " | 内存 %.1f MB", mb) : ""
+            let drops = decoder?.droppedFrames ?? 0
             DispatchQueue.main.async { [weak self] in
-                self?.appendLog("帧率 \(fpsText) fps\(memText)")
+                self?.appendLog("帧率 \(fpsText) fps\(memText) | 丢帧 \(drops)")
             }
         }
 
